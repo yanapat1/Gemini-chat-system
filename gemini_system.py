@@ -11,10 +11,11 @@ class ModelResponse(BaseModel):
     cost: float = 0.
 
 class ModelGemini:
-    def __init__(self, token: str, model_name: str = "gemini-1.5-flash-8b"):
+    def __init__(self, token: str, model_name: str = "gemini-1.5-flash-8b", memory: bool = False):
         genai.configure(api_key=token)
 
         self.model_name = model_name
+        self.memory = memory
 
         self.safety_settings = {
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -123,29 +124,6 @@ class ModelGemini:
             tools = self.tools_calling
         )
 
-    def create_tasks(self, content):
-        if 'text' in content:
-            self.history.append({'role':'model', 'parts': [content]})
-        if 'function_call' in content:
-            function_name = content.function_call.name
-            self.tasks.append({'agent': function_name, 'content': dict(content.function_call.args).get('quesiton')})
-
-    async def generate_text(self, content: str | list[Dict]):
-        if isinstance(content, str):
-            self.history.append({'role':'user', 'parts': [content]})
-            chat = self.model.start_chat()
-        if isinstance(content, list):
-            self.history = content[:-1]
-            chat = self.model.start_chat(history=self.history)
-            content = content[-1]['parts'][0]
-        global responses
-        responses = await chat.send_message_async(content)
-
-        for response in responses.parts:
-            self.create_tasks(response)
-
-        return responses
-
     def gemini_1p5_flash_8b(self, input_token: int, output_token: int) -> float:
         if input_token <= 128_000:
             in_cost = ( input_token / 1_000_000 ) * 0.0375
@@ -159,6 +137,35 @@ class ModelGemini:
         cost = in_cost + op_cost
         return cost
 
+    def manage_content(self, content):
+        if isinstance(content, str):
+            if self.memory and self.history:
+                chat = self.model.start_chat(history=self.history)
+                self.history.append({'role':'user', 'parts': [content]})
+            elif self.memory:
+                self.history.append({'role':'user', 'parts': [content]})
+                chat = self.model.start_chat()
+            else:
+                chat = self.model.start_chat()
+        elif isinstance(content, list):
+            if self.memory and self.history:
+                self.history += content[:-1]
+                chat = self.model.start_chat(history=self.history)
+                content = content[-1]['parts'][0]
+            elif self.memory:
+                if len(content) <= 1:
+                    self.history = content
+                    chat = self.model.start_chat()
+                    content = content[-1]['parts'][0]
+                else:
+                    self.history = content[:-1]
+                    chat = self.model.start_chat(history=self.history)
+                    content = content[-1]['parts'][0]
+            else:
+                chat = self.model.start_chat(history=content[:-1])
+                content = content[-1]['parts'][0]
+        return chat, content
+
     def calculated_cost(self, input_token: int, output_token: int) -> float:
         match self.model_name:
             case 'gemini-1.5-flash-8b': cost = self.gemini_1p5_flash_8b(input_token, output_token)
@@ -166,7 +173,22 @@ class ModelGemini:
                 
         return cost
 
-    async def ainvoke(self, content: str | List[Dict], **kwargs):
+    ### SYNC FUNCTION ###
+    def generate_text(self, content: str | list[Dict]):
+        
+        chat, content = self.manage_content(content)
+        responses = chat.send_message(content)
+
+        return responses
+    
+    def generate_stream_text(self, content: str | list[Dict]):
+
+        chat, content = self.manage_content(content)
+        responses = chat.send_message(content, stream=True)
+
+        return responses
+    
+    def invoke(self, content: str | List[Dict], **kwargs):
         if kwargs:
             self.add_generation_config(**kwargs)
         response = self.generate_text(content)
@@ -174,6 +196,9 @@ class ModelGemini:
         input_tokens = response.usage_metadata.prompt_token_count
         output_tokens = response.usage_metadata.candidates_token_count
         cost = self.calculated_cost(input_tokens, output_tokens)
+
+        if self.memory:
+            self.history.append({'role':'model', 'parts': [response.text]})
 
         info_response = ModelResponse(
             content = response.candidates[0].content.parts[0].text,
@@ -187,3 +212,103 @@ class ModelGemini:
             cost = cost
         )
         return info_response
+    
+    def stream(self, content: str | List[Dict], **kwargs):
+        if kwargs:
+            self.add_generation_config(**kwargs)
+
+        response = self.generate_stream_text(content)
+        
+        parts = ['']
+        for steam in response:
+            if self.memory:
+                parts[0] += steam.text
+
+            input_tokens = steam.usage_metadata.prompt_token_count
+            output_tokens = steam.usage_metadata.candidates_token_count
+            cost = self.calculated_cost(input_tokens, output_tokens)
+
+            info_response = ModelResponse(
+                content = steam.candidates[0].content.parts[0].text,
+                usage_metadata={
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": steam.usage_metadata.total_token_count
+                },
+                model_version = steam.model_version,
+                avg_logprobs = steam.candidates[0].avg_logprobs,
+                cost = cost
+            )
+            yield info_response
+        if self.memory:
+            self.history.append({'role':'model', 'parts': parts})
+
+    ### ASYNC FUNCTION ###
+    async def agenerate_text(self, content: str | list[Dict]):
+
+        chat, content = self.manage_content(content)
+        responses = await chat.send_message_async(content)
+
+        return responses
+    
+    async def agenerate_stream_text(self, content: str | list[Dict]):
+
+        chat, content = self.manage_content(content)
+        responses = await chat.send_message_async(content, stream=True)
+
+        return responses
+
+    async def ainvoke(self, content: str | List[Dict], **kwargs):
+        if kwargs:
+            self.add_generation_config(**kwargs)
+        response = await self.agenerate_text(content)
+        
+        input_tokens = response.usage_metadata.prompt_token_count
+        output_tokens = response.usage_metadata.candidates_token_count
+        cost = self.calculated_cost(input_tokens, output_tokens)
+
+        if self.memory:
+            self.history.append({'role':'model', 'parts': [response.text]})
+
+        info_response = ModelResponse(
+            content = response.candidates[0].content.parts[0].text,
+            usage_metadata={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": response.usage_metadata.total_token_count
+            },
+            model_version = response.model_version,
+            avg_logprobs = response.candidates[0].avg_logprobs,
+            cost = cost
+        )
+        return info_response
+    
+    async def astream(self, content: str | List[Dict], **kwargs):
+        if kwargs:
+            self.add_generation_config(**kwargs)
+        global response
+        response = await self.agenerate_stream_text(content)
+        
+        parts = ['']
+        async for steam in response:
+            if self.memory:
+                parts[0] += steam.text
+
+            input_tokens = steam.usage_metadata.prompt_token_count
+            output_tokens = steam.usage_metadata.candidates_token_count
+            cost = self.calculated_cost(input_tokens, output_tokens)
+
+            info_response = ModelResponse(
+                content = steam.candidates[0].content.parts[0].text,
+                usage_metadata={
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": steam.usage_metadata.total_token_count
+                },
+                model_version = steam.model_version,
+                avg_logprobs = steam.candidates[0].avg_logprobs,
+                cost = cost
+            )
+            yield info_response
+        if self.memory:
+            self.history.append({'role':'model', 'parts': parts})
