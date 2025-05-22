@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 class ModelResponse(BaseModel):
     content: str
-    usage_metadata: dict
+    usage_metadata: Dict
     model_version: str = None
     avg_logprobs: float = None
     cost: float = 0.
@@ -34,13 +34,15 @@ class ModelGemini:
         self.history: List[Dict] = list()
 
         self.model = genai.GenerativeModel(
-            model_name,
-            generation_config=self.generation_config,
-            safety_settings=self.safety_settings
+            self.model_name,
+            generation_config = self.generation_config,
+            safety_settings = self.safety_settings,
+            system_instruction = self.system_instruction,
+            tools = self.tools_calling
             )
     
     def __repr__(self):
-        return f'Gemini -> {self.model_name}'
+        return self.model
 
     def add_system_prompt(self, system_instruction):
         self.system_instruction = system_instruction
@@ -53,7 +55,22 @@ class ModelGemini:
             )
 
     def add_tool_call(self, tools_calling: List[object]):
-        self.tools_calling = tools_calling
+        if self.tools_calling:
+            if isinstance(tools_calling, list):
+                for tool in tools_calling:
+                    if tool not in self.tools_calling:
+                        self.tools_calling.append(tool)
+                    else:
+                        self.tools_calling[self.tools_calling.index(tool)] = tool
+            elif isinstance(tools_calling, object):
+                if tools_calling not in self.tools_calling:
+                    self.tools_calling.append(tools_calling)
+                else:
+                    self.tools_calling[self.tools_calling.index(tool)] = tools_calling
+            else:
+                self.tools_calling += tools_calling if isinstance(tools_calling, list) else [tools_calling]
+        else:
+            self.tools_calling = tools_calling if isinstance(tools_calling, list) else [tools_calling]
         self.model = genai.GenerativeModel(
             self.model_name,
             generation_config = self.generation_config,
@@ -61,6 +78,7 @@ class ModelGemini:
             system_instruction = self.system_instruction,
             tools = self.tools_calling
             )
+        print(1 if self.tools_calling else 2)
     
     def add_generation_config(self, **kwargs):
         ''' 
@@ -126,43 +144,59 @@ class ModelGemini:
 
     def gemini_1p5_flash_8b(self, input_token: int, output_token: int) -> float:
         if input_token <= 128_000:
-            in_cost = ( input_token / 1_000_000 ) * 0.0375
+            ip_cost = ( input_token / 1_000_000 ) * 0.0375
         else:
-            in_cost = ( input_token / 1_000_000 ) * 0.0750
+            ip_cost = ( input_token / 1_000_000 ) * 0.0750
         if output_token <= 128_000:
             op_cost = ( output_token / 1_000_000 ) * 0.150
         else:
             op_cost = ( output_token / 1_000_000 ) * 0.300
         
-        cost = in_cost + op_cost
+        cost = ip_cost + op_cost
         return cost
 
+    def start_chat_(self, history: List[Dict] = None):
+        if history and self.tools_calling:
+            print('tool 1')
+            chat = self.model.start_chat(history=self.history, enable_automatic_function_calling=True)
+        elif history:
+            print('tool 2')
+            chat = self.model.start_chat(history=self.history)
+        elif self.tools_calling:
+            print('tool 3')
+            chat = self.model.start_chat(enable_automatic_function_calling=True)
+        else:
+            print('tool 4')
+            chat = self.model.start_chat()
+        return chat
+
     def manage_content(self, content):
+        # enable_automatic_function_calling=True
         if isinstance(content, str):
             if self.memory and self.history:
-                chat = self.model.start_chat(history=self.history)
+                chat = self.start_chat_(history=self.history)
                 self.history.append({'role':'user', 'parts': [content]})
             elif self.memory:
                 self.history.append({'role':'user', 'parts': [content]})
-                chat = self.model.start_chat()
+                chat = self.start_chat_()
             else:
-                chat = self.model.start_chat()
+                chat = self.start_chat_()
         elif isinstance(content, list):
             if self.memory and self.history:
                 self.history += content[:-1]
-                chat = self.model.start_chat(history=self.history)
+                chat = self.start_chat_(history=self.history)
                 content = content[-1]['parts'][0]
             elif self.memory:
                 if len(content) <= 1:
                     self.history = content
-                    chat = self.model.start_chat()
+                    chat = self.start_chat_()
                     content = content[-1]['parts'][0]
                 else:
                     self.history = content[:-1]
-                    chat = self.model.start_chat(history=self.history)
+                    chat = self.start_chat_(history=self.history)
                     content = content[-1]['parts'][0]
             else:
-                chat = self.model.start_chat(history=content[:-1])
+                chat = self.start_chat_(history=content[:-1])
                 content = content[-1]['parts'][0]
         return chat, content
 
@@ -201,7 +235,7 @@ class ModelGemini:
             self.history.append({'role':'model', 'parts': [response.text]})
 
         info_response = ModelResponse(
-            content = response.candidates[0].content.parts[0].text,
+            content = response.text,
             usage_metadata={
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -312,3 +346,11 @@ class ModelGemini:
             yield info_response
         if self.memory:
             self.history.append({'role':'model', 'parts': parts})
+
+if __name__ == '__main__':
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+
+    chat = ModelGemini(token=os.getenv('GEMINI_TOKEN'))
+    chat = ModelGemini(token=os.getenv('GEMINI_TOKEN'), memory=True)
